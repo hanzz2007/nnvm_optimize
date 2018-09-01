@@ -147,6 +147,13 @@ namespace nnvm {
                 const IndexedGraph* idx_;
             };
 
+            struct InputSlice
+            {
+                ChunkSlice sid;
+                size_t offset;
+                size_t beg;
+                size_t end;
+            };
 
             size_t PlanChunk(const Graph& ret, const IndexedGraph& idx,
                 const std::pair<uint32_t, uint32_t>& node_range,
@@ -226,43 +233,96 @@ namespace nnvm {
                     }
                     
                     if (inode.source->op() == concat_op && 
-                        fis_memory_fusable[inode.source->op()](inode.source->attrs, shape_vec[idx.entry_id(nid, 0)])) // concat
+                        fis_memory_fusable[inode.source->op()](
+                            inode.source->attrs, shape_vec[idx.entry_id(nid, 0)])) // concat
                     {
                         CHECK_EQ(inode.source->num_outputs(), 1);
-                        uint32_t eid_out = idx.entry_id(nid, 0);
-
-                        const uint32_t out_size = shape_vec[eid_out].Size() * mshadow::mshadow_sizeof(dtype_vec[eid_out]);
-                        ChunkSlice sid_out = Chunk::make(out_size)->slice(0, out_size);
-
-                        uint32_t offset = 0;
-                        std::unordered_set<ChunkPtr> in_chunks;
-// 
-//                         for (size_t i = 0; i < inode.source->num_inputs(); ++i)
-//                         {
-//                             uint32_t eid_in = idx.entry_id(inode.source->inputs[i]);
-//                             const uint32_t in_size = shape_vec[eid_in].Size() * mshadow::mshadow_sizeof(dtype_vec[eid_in]);
-// 
-//                             ChunkSlice sid_in = storage[eid_in];
-//                             if (sid_in.is_null())
-//                             {
-//                                 offset += in_size;
-//                                 continue;
-//                             }
-//                         }
-
-                        for (size_t i = 0; i < inode.source->num_inputs(); ++i)
+                       
+                        std::vector<InputSlice> cand_input_chunks; // valid candidate input chunks (may be merged)
                         {
-                            uint32_t eid_in = idx.entry_id(inode.source->inputs[i]);
-                            const uint32_t in_size = shape_vec[eid_in].Size() * mshadow::mshadow_sizeof(dtype_vec[eid_in]);
+                            size_t offset = 0;
+                            InputSlice prev_input;  // (merged_input, [beg_in, end_in])
 
-                            ChunkSlice sid_in = storage[eid_in];
-                            if (sid_in.is_null()) 
+                            for (size_t i = 0; i < inode.source->num_inputs(); ++i)
                             {
+                                uint32_t eid_in = idx.entry_id(inode.source->inputs[i]);
+                                const size_t in_size = shape_vec[eid_in].Size() * mshadow::mshadow_sizeof(dtype_vec[eid_in]);
+
+                                ChunkSlice sid_in = storage[eid_in];
+                                ChunkSlice sid_in_lower = sid_in.lower();
+
+                                if (!prev_input.sid.is_null())
+                                {
+                                    ChunkSlice prev_sid_in_lower = prev_input.sid.lower();
+                                    if (prev_sid_in_lower.source() == sid_in_lower.source() &&
+                                        prev_sid_in_lower.offset() + prev_sid_in_lower.size() == sid_in_lower.offset())
+                                    {
+                                        // The two inputs are continous, can be merged
+                                        prev_input.sid = prev_sid_in_lower.source()->slice(
+                                            prev_sid_in_lower.offset(), prev_sid_in_lower.size() + sid_in_lower.size());
+                                        prev_input.end = i;
+                                    }
+                                    else
+                                    {
+                                        // Prev inputs can be overlapped in Left side, or can be whole embeded
+                                        if ((prev_sid_in_lower.offset() + prev_sid_in_lower.size() == prev_sid_in_lower.source()->size() &&
+                                                prev_input.beg == 0)
+                                            || (prev_sid_in_lower.size() == prev_sid_in_lower.source()->size()))
+                                        {
+                                            InputSlice new_cand = prev_input;
+                                            new_cand.sid = prev_sid_in_lower;
+                                            cand_input_chunks.push_back(new_cand);
+                                        }
+
+                                        prev_input = { sid_in_lower, offset, i, i};
+                                    }
+                                }
+                                else {
+                                    prev_input = { sid_in_lower, offset, i, i};
+                                }
+
+                                // Check the last
+                                if (i + 1 == inode.source->num_inputs() && !prev_input.sid.is_null())
+                                {
+                                    CHECK_EQ(prev_input.end, i);
+                                    // Last inputs can be overlapped in Right side, 
+                                    // or out can be fully contained in input,
+                                    // or input can be whole embeded in out, 
+                                    ChunkSlice prev_sid_in_lower = prev_input.sid.lower();
+                                    if ((prev_sid_in_lower.offset() == 0)
+                                        || (prev_input.beg == 0)
+                                        || (prev_sid_in_lower.size() == prev_sid_in_lower.source()->size()))
+                                    {
+                                        InputSlice new_cand = prev_input;
+                                        new_cand.sid = prev_sid_in_lower;
+                                        cand_input_chunks.push_back(new_cand);
+                                    }
+                                }
+
                                 offset += in_size;
-                                continue;
                             }
 
-                            ChunkSlice sid_in_lower = sid_in.lower();
+                            // We should sort to make the best choice
+                            std::sort(cand_input_chunks.begin(), cand_input_chunks.end(),
+                                [](const InputSlice& lhs, const InputSlice& rhs) {
+                                return lhs.sid.size() > rhs.sid.size();
+                            });
+                        }
+
+                        const uint32_t eid_out = idx.entry_id(nid, 0);
+                        const size_t out_size = shape_vec[eid_out].Size() * mshadow::mshadow_sizeof(dtype_vec[eid_out]);
+                        ChunkSlice sid_out = Chunk::make(out_size)->slice(0, out_size);
+                        std::unordered_set<ChunkPtr> in_chunks;
+
+                        for (size_t i = 0; i < cand_input_chunks.size(); ++i)
+                        {
+                            const InputSlice in_ck = cand_input_chunks[i];
+                            const size_t in_size = in_ck.sid.size();
+                            const size_t offset = in_ck.offset;
+                            const size_t beg = in_ck.beg, end = in_ck.end;
+                            ChunkSlice sid_in_lower = in_ck.sid.lower();
+
+                            // avoid non-cont same chunk inputs to be wrong fused into one out
                             if (in_chunks.count(sid_in_lower.source()) < 1)
                             {
                                 ChunkSlice sid_out_lower = sid_out.lower();
@@ -270,40 +330,51 @@ namespace nnvm {
                                 if (sid_in_lower.offset() == 0 &&
                                     sid_in_lower.size() == sid_in_lower.source()->size())
                                 {
+                                    // input fully embeded in output
                                     sid_in_lower.source()->embed_in(sid_out.source(), offset);
 
                                     chunk_ref_count[sid_out.source()->root_parent()] += chunk_ref_count[sid_in_lower.source()];
                                     chunk_ref_count[sid_in_lower.source()] = 0;
                                 }
-                                else if (i == 0 &&
+                                else if (beg == 0 &&
                                     sid_in_lower.offset() + sid_in_lower.size() == sid_in_lower.source()->size() &&
                                     sid_out_lower.offset() == 0)
                                 {
-                                    uint32_t new_size = sid_out_lower.source()->size() + sid_in_lower.source()->size() - in_size;
+                                    // 
+//                                     CHECK_EQ(sid_out_lower.offset(), 0);
+                                    size_t new_size = sid_out_lower.source()->size() + sid_in_lower.source()->size() - in_size;
                                     ChunkPtr shared_chunk = sid_out_lower.source()->expand(new_size, Chunk::ExpandDirection::kExpandHead);
                                     sid_in_lower.source()->embed_in(shared_chunk, 0);
 
                                     chunk_ref_count[shared_chunk] = chunk_ref_count[sid_out_lower.source()] + chunk_ref_count[sid_in_lower.source()];
                                     chunk_ref_count[sid_out_lower.source()] = chunk_ref_count[sid_in_lower.source()] = 0;
                                 }
-                                else if (i + 1 == inode.source->num_inputs() &&
+                                else if (end + 1 == inode.source->num_inputs() &&
                                     sid_in_lower.offset() == 0 &&
                                     sid_out_lower.offset() + sid_out_lower.size() == sid_out_lower.source()->size())
                                 {
-                                    uint32_t new_size = sid_out_lower.source()->size() + sid_in_lower.source()->size() - in_size;
+                                    size_t new_size = sid_out_lower.source()->size() + sid_in_lower.source()->size() - in_size;
                                     ChunkPtr shared_chunk = sid_out_lower.source()->expand(new_size, Chunk::ExpandDirection::kExpandTail);
                                     sid_in_lower.source()->embed_in(shared_chunk, new_size - sid_in_lower.source()->size());
 
                                     chunk_ref_count[shared_chunk] = chunk_ref_count[sid_out_lower.source()] + chunk_ref_count[sid_in_lower.source()];
                                     chunk_ref_count[sid_out_lower.source()] = chunk_ref_count[sid_in_lower.source()] = 0;
                                 }
+                                else if (end - beg == inode.source->num_inputs())
+                                {
+                                    CHECK_EQ(cand_input_chunks.size(), 1);
+                                    // whole outputs share the slice of input chunk
+                                    sid_out_lower.source()->embed_in(sid_in_lower.source(), sid_in_lower.offset());
+                                    CHECK_EQ(chunk_ref_count[sid_out_lower.source()], 0);
+//                                     chunk_ref_count[sid_in_lower.source()] += chunk_ref_count[sid_out_lower.source()];
+//                                     chunk_ref_count[sid_out_lower.source()] = 0;
+                                }
                                 else {
                                     // Share nothing
-                                    LOG(INFO) << "Op: " << inode.source->attrs.name << " no share input: " << i;
+                                    LOG(INFO) << "Op: " << inode.source->attrs.name << " no share input: " << beg << "-" << end;
                                 }
                             }
 
-                            offset += in_size;
                         }
 
                         storage[eid_out] = sid_out;

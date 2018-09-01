@@ -164,6 +164,12 @@ using FSetInputVarAttrOnCompose = std::function<void(
     NodePtr var,
     const int index)>;
 
+using FMemorySplit = std::function<std::vector<int64_t>(const nnvm::NodeAttrs& attrs,
+    const std::vector<nnvm::TShape>& inputs,
+    const std::vector<nnvm::TShape>& outputs)>;
+
+using FIsMemoryFusable = std::function<bool(const nnvm::NodeAttrs& attrs,
+    const nnvm::TShape& in_shape)>;
 }  // namespace nnvm
 
 #endif  // NNVM_OP_ATTR_TYPES_H_

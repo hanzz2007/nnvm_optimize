@@ -217,7 +217,11 @@ namespace nnvm {
                             if (taken[kv.first] == false &&
                                 sid_out.is_null() &&
                                 !sid_in.is_null() &&
-                                (chunk_ref_count[sid_in.source()->root_parent()] == 1 || identity[ipair]) &&
+                                // TODO: chunk refcount is too coarse
+                                // (chunk_ref_count[sid_in.source()->root_parent()] == 1 || identity[ipair]) &&
+                                // TODO: Think carefully, it is safe to count on entry refcount,
+                                // rather than chunk refcount
+                                (storage_ref_count[sid_in] == 1 || identity[ipair]) &&
                                 entry_ref_count[eid_out] > 0 &&
                                 shape_vec[eid_out].Size() == shape_vec[eid_in].Size() &&
                                 dtype_vec[eid_out] == dtype_vec[eid_in])

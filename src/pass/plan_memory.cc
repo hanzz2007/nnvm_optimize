@@ -313,6 +313,22 @@ namespace nnvm {
                         const size_t out_size = shape_vec[eid_out].Size() * mshadow::mshadow_sizeof(dtype_vec[eid_out]);
                         ChunkSlice sid_out = Chunk::make(out_size)->slice(0, out_size);
                         std::unordered_set<ChunkPtr> in_chunks;
+                        auto fin_same_chunk = [](const std::unordered_set<ChunkPtr>& in_chunks, ChunkPtr chunk)
+                        {
+                            if (in_chunks.count(chunk) > 0) {
+                                return true;
+                            }
+                           for (auto ck : in_chunks) {
+                               ck = ck->parent();
+                               while (ck && ck != chunk) {
+                                   ck = ck->parent();
+                               }
+                               if (ck) {
+                                   return true;
+                               }
+                           }
+                           return false;
+                        };
 
                         for (size_t i = 0; i < cand_input_chunks.size(); ++i)
                         {
@@ -323,7 +339,7 @@ namespace nnvm {
                             ChunkSlice sid_in_lower = in_ck.sid.lower();
 
                             // avoid non-cont same chunk inputs to be wrong fused into one out
-                            if (in_chunks.count(sid_in_lower.source()) < 1)
+                            if (!fin_same_chunk(in_chunks, sid_in_lower.source()))
                             {
                                 ChunkSlice sid_out_lower = sid_out.lower();
 
@@ -335,6 +351,7 @@ namespace nnvm {
 
                                     chunk_ref_count[sid_out.source()->root_parent()] += chunk_ref_count[sid_in_lower.source()];
                                     chunk_ref_count[sid_in_lower.source()] = 0;
+                                    in_chunks.insert(sid_in_lower.source());
                                 }
                                 else if (beg == 0 &&
                                     sid_in_lower.offset() + sid_in_lower.size() == sid_in_lower.source()->size() &&
@@ -348,6 +365,7 @@ namespace nnvm {
 
                                     chunk_ref_count[shared_chunk] = chunk_ref_count[sid_out_lower.source()] + chunk_ref_count[sid_in_lower.source()];
                                     chunk_ref_count[sid_out_lower.source()] = chunk_ref_count[sid_in_lower.source()] = 0;
+                                    in_chunks.insert(sid_in_lower.source());
                                 }
                                 else if (end + 1 == inode.source->num_inputs() &&
                                     sid_in_lower.offset() == 0 &&
@@ -359,13 +377,15 @@ namespace nnvm {
 
                                     chunk_ref_count[shared_chunk] = chunk_ref_count[sid_out_lower.source()] + chunk_ref_count[sid_in_lower.source()];
                                     chunk_ref_count[sid_out_lower.source()] = chunk_ref_count[sid_in_lower.source()] = 0;
+                                    in_chunks.insert(sid_in_lower.source());
                                 }
-                                else if (end - beg == inode.source->num_inputs())
+                                else if (end - beg + 1 == inode.source->num_inputs())
                                 {
                                     CHECK_EQ(cand_input_chunks.size(), 1);
                                     // whole outputs share the slice of input chunk
                                     sid_out_lower.source()->embed_in(sid_in_lower.source(), sid_in_lower.offset());
                                     CHECK_EQ(chunk_ref_count[sid_out_lower.source()], 0);
+                                    in_chunks.insert(sid_in_lower.source());
 //                                     chunk_ref_count[sid_in_lower.source()] += chunk_ref_count[sid_out_lower.source()];
 //                                     chunk_ref_count[sid_out_lower.source()] = 0;
                                 }
@@ -677,7 +697,7 @@ namespace nnvm {
                             sid = allocator->Request(dev_id, root_chunk->size(), nid);
                             chunk_allocated[root_chunk] = sid;
                             storage_ref_count[sid] = chunk_ref_count[root_chunk];
-                            vsid_size[sid] = root_chunk->size();
+                            vsid_size[sid] = std::max(root_chunk->size(), vsid_size[sid]);
 
                             std::cout << "Alloc chunk=" << sid << "\ttotal=" << vsid_size[sid] 
                                 << " \teid=" << eid << " \tsize=" 

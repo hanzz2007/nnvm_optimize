@@ -1,6 +1,7 @@
 [submodule "plugin/nnvm-fusion"]
 	path = plugin/nnvm-fusion
-	url = https://github.com/dmlc/nnvm-fusion.git
+	#url = https://github.com/dmlc/nnvm-fusion.git
+	url =  https://github.com/hanzz2007/nnvm_optimize.git
 [submodule "dmlc-core"]
 	path = dmlc-core
 	url = https://github.com/dmlc/dmlc-core

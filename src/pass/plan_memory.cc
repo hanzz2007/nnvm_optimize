@@ -703,14 +703,14 @@ namespace nnvm {
                             storage_ref_count[sid] = chunk_ref_count[root_chunk];
                             vsid_size[sid] = std::max(root_chunk->size(), vsid_size[sid]);
 
-                            std::cout << "Alloc chunk=" << sid << "\ttotal=" << vsid_size[sid] 
+                            std::cout << "Alloc chunk=" << sid << " \ttotal=" << vsid_size[sid] 
                                 << " \teid=" << eid << " \tsize=" 
                                 << shape_vec[eid].Size() * mshadow::mshadow_sizeof(dtype_vec[eid]) << std::endl;
                         } 
                         else {
                             sid = it->second;
 
-                            std::cout << "Share chunk=" << sid << "\ttotal=" << vsid_size[sid]
+                            std::cout << "Share chunk=" << sid << " \ttotal=" << vsid_size[sid]
                                 << " \teid=" << eid << " \tsize="
                                 << shape_vec[eid].Size() * mshadow::mshadow_sizeof(dtype_vec[eid]) << std::endl;
                         }

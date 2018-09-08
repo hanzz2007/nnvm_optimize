@@ -153,6 +153,10 @@ namespace nnvm {
                 size_t offset;
                 size_t beg;
                 size_t end;
+
+                size_t size() const {
+                    return end - beg + 1;
+                }
             };
 
             size_t PlanChunk(const Graph& ret, const IndexedGraph& idx,
@@ -343,8 +347,8 @@ namespace nnvm {
                             ChunkSlice sid_in_lower = in_ck.sid.lower();
 
                             // avoid non-cont same chunk inputs to be wrong fused into one out
-                            if (!fin_same_chunk(in_chunks, sid_in_lower.source()))
-                            {
+//                             if (!fin_same_chunk(in_chunks, sid_in_lower.source()))
+//                             {
                                 ChunkSlice sid_out_lower = sid_out.lower();
 
                                 if (sid_in_lower.offset() == 0 &&
@@ -393,12 +397,47 @@ namespace nnvm {
 //                                     chunk_ref_count[sid_in_lower.source()] += chunk_ref_count[sid_out_lower.source()];
 //                                     chunk_ref_count[sid_out_lower.source()] = 0;
                                 }
-                                else {
-                                    // Share nothing
-                                    LOG(INFO) << "Op: " << inode.source->attrs.name << " no share input: " << beg << "-" << end;
-                                }
-                            }
+                                else
+                                {
+                                    // Make sure input chunk can be large enough to host output chunk
+                                    if (sid_in_lower.offset() >= in_ck.offset && 
+                                        sid_in_lower.source()->size() - sid_in_lower.offset() >= out_size - in_ck.offset)
+                                    {
+                                        bool is_ok = true;
 
+                                        const size_t head_offset = sid_in_lower.offset() - in_ck.offset;
+                                        if (head_offset > 0) 
+                                        {
+                                            ChunkSlice head_sid = sid_in_lower.source()->slice(head_offset, in_ck.offset);
+                                            if (1/*front_sid refcount > 0*/) {
+                                                is_ok = false;
+                                            }
+                                        }
+
+                                        const size_t tail_size = out_size - (in_ck.size() + in_ck.offset);
+                                        const size_t tail_offset = sid_in_lower.offset() + sid_in_lower.size();
+                                        if (is_ok && tail_size > 0) 
+                                        {
+                                            CHECK_LT(tail_offset, sid_in_lower.source()->size());
+                                            ChunkSlice tail_sid = sid_in_lower.source()->slice(tail_offset, tail_size);
+                                            if (1/*tail_sid refcount > 0*/) {
+                                                is_ok = false;
+                                            }
+                                        }
+
+                                        if (is_ok) {
+                                            sid_out_lower.source()->embed_in(sid_in_lower.source(), head_offset);
+                                        }
+                                    }
+                                    
+
+                                    else
+                                    {
+                                        // Share nothing
+                                        LOG(INFO) << "Op: " << inode.source->attrs.name << " no share input: " << beg << "-" << end;
+                                    }
+                                }
+//                             }
                         }
 
                         storage[eid_out] = sid_out;
@@ -631,6 +670,246 @@ namespace nnvm {
                 }
                 return num_not_allocated;
             }
+
+            // The parent of all the sids is same
+            class ChunkRef
+            {
+            public:
+                ChunkRef(const ChunkPtr& chunk) 
+                    : chunk_(chunk->root_parent())
+                {
+                }
+
+                void add_ref(const ChunkSlice& sid, const size_t ref_count)
+                {
+                    auto sid_lower = sid.lower();
+                    CHECK(!sid_lower.is_null());
+                    CHECK_EQ(sid_lower.source(), chunk_->root_parent());
+
+                    const size_t offset = chunk_->root_offset();
+                    const Range sid_range = { sid_lower.offset(), sid_lower.offset() + sid_lower.size() };
+
+                    for (auto it = ref_vec_.begin(); it != ref_vec_.end(); /*++it*/)
+                    {
+                        // update the offset first
+                        it->first.begin += offset;
+
+                        auto cmp_result = it->first.compare_with(sid_range);
+                        CHECK_NE(cmp_result, Range::CompareResult::kIntersect);
+
+                        if (cmp_result == Range::CompareResult::kNone) {
+                            ++it;
+                            continue;
+                        }
+
+                        if (cmp_result == Range::CompareResult::kContains) 
+                        {
+                            std::vector<Range> sub_ranges;
+                            const size_t idx = it->first.breakup(sid_range, &sub_ranges);
+
+                            const size_t old_n = it->second;
+                            it = ref_vec_.erase(it);
+
+                            for (size_t i = 0; i < sub_ranges.size(); ++i) 
+                            {
+                                size_t n = old_n;
+                                if (i == idx) {
+                                    n += ref_count;
+                                }
+                                it = ref_vec_.insert(it, { sub_ranges[i], n });
+                            }
+                        }
+                        else if (cmp_result == Range::CompareResult::kInvertContains)
+                        {
+                            it->second += ref_count;
+                            ++it;
+                        }
+                        else {
+                            LOG(FATAL) << "Invalid compare result: " << (int)cmp_result;
+                        }
+                    }
+                }
+
+                void del_ref(const ChunkSlice& sid, const size_t ref_count) 
+                {
+                    auto sid_lower = sid.lower();
+                    CHECK(!sid_lower.is_null());
+                    CHECK_EQ(sid_lower.source(), chunk_->root_parent());
+
+                    const size_t offset = chunk_->root_offset();
+                    const Range sid_range = { sid_lower.offset(), sid_lower.offset() + sid_lower.size() };
+
+                    for (auto it = ref_vec_.begin(); it != ref_vec_.end(); /*++it*/)
+                    {
+                        // update the offset first
+                        it->first.begin += offset;
+
+                        auto cmp_result = it->first.compare_with(sid_range);
+
+                        // skip the non-relevent
+                        if (cmp_result == Range::CompareResult::kNone) {
+                            ++it;
+                            continue;
+                        }
+
+                        CHECK_NE(cmp_result, Range::CompareResult::kIntersect);
+
+                        if (cmp_result == Range::CompareResult::kContains)
+                        {
+                            std::vector<Range> sub_ranges;
+                            const size_t idx = it->first.breakup(sid_range, &sub_ranges);
+
+                            const size_t old_n = it->second;
+                            it = ref_vec_.erase(it);
+
+                            for (size_t i = 0; i < sub_ranges.size(); ++i)
+                            {
+                                size_t n = old_n;
+                                if (i == idx) {
+                                    n -= ref_count;
+                                }
+                                if (n == 0) {
+                                    continue;
+                                }
+                                it = ref_vec_.insert(it, { sub_ranges[i], n });
+                            }
+                        }
+                        else if (cmp_result == Range::CompareResult::kInvertContains)
+                        {
+                            it->second -= ref_count;
+                            if (it->second == 0) {
+                                it = ref_vec_.erase(it);
+                            }
+                            else {
+                                ++it;
+                            }
+                        }
+                        else {
+                            LOG(FATAL) << "Invalid compare result: " << (int)cmp_result;
+                        }
+                    }
+                }
+
+                size_t ref_count(const ChunkSlice& sid)
+                {
+                    auto sid_lower = sid.lower();
+                    CHECK(!sid_lower.is_null());
+                    CHECK_EQ(sid_lower.source(), chunk_->root_parent());
+
+                    const size_t offset = chunk_->root_offset();
+                    const Range sid_range = { sid_lower.offset(), sid_lower.offset() + sid_lower.size() };
+
+                    size_t n = 0;
+                    for (auto it = ref_vec_.begin(); it != ref_vec_.end(); ++it)
+                    {
+                        // update the offset first
+                        it->first.begin += offset;
+
+                        auto cmp_result = it->first.compare_with(sid_range);
+                        CHECK_NE(cmp_result, Range::CompareResult::kIntersect);
+
+                        if (cmp_result != Range::CompareResult::kNone) {
+                            // NOTICE! This is not always true, for in a big chunk
+                            // different parts referenced by different node,
+                            // so the true ref count should be the sum.
+                            // Here it is safe to use the Maximum, for we only care
+                            // about whether the part of the chunk is referenced by other node
+                            n = std::max(n, it->second);
+                        }
+                    }
+
+                    return n;
+                }
+
+                ChunkPtr source() {
+                    return chunk_;
+                }
+
+            private:
+                ChunkPtr chunk_;
+                size_t offset_{ 0 };
+
+                struct Range 
+                {
+                    size_t begin{ 0 };
+                    size_t end{ 0 };
+
+                    enum class CompareResult {
+                        kContains, // 包含
+                        kInvertContains, // 被包含
+                        kIntersect, // 交叉  注意: 不允许出现这种情况！
+                        kNone // 没有重叠部分
+                    };
+
+                    CompareResult compare_with(const Range other) 
+                    {
+                        if (other.begin >= end || begin >= other.end) {
+                            return CompareResult::kNone;
+                        }
+
+                        if (other.begin >= begin)
+                        {
+                            if (other.end <= end) {
+                                return CompareResult::kContains;
+                            }
+                            else {
+                                return CompareResult::kIntersect;
+                            }
+                        }
+                        else
+                        {
+                            if (other.end >= end) {
+                                return CompareResult::kInvertContains;
+                            }
+                            else {
+                                return CompareResult::kIntersect;
+                            }
+                        }
+                    }
+
+                    size_t breakup(const Range new_range, std::vector<Range>* ranges_ptr)
+                    {
+                        CHECK_GE(new_range.begin, begin);
+                        CHECK_LE(new_range.end, end);
+                        CHECK_GT(new_range.end - new_range.begin, 0);
+
+                        auto& ranges = *ranges_ptr;
+                        ranges.clear();
+                        size_t idx = 0;
+
+                        if (new_range.begin == begin && new_range.end == end) {
+                            idx = 0;
+                            ranges.push_back(new_range);
+                        }
+
+                        if (new_range.begin == begin && new_range.end < end) 
+                        {
+                            idx = 0;
+                            ranges.push_back(new_range);
+                            ranges.push_back({ new_range.end, end });
+                        }
+                        else if (new_range.begin > begin && new_range.end == end) 
+                        {
+                            idx = 1;
+                            ranges.push_back({ begin, new_range.begin });
+                            ranges.push_back(new_range);
+                        }
+                        else 
+                        {
+                            idx = 1;
+                            ranges.push_back({ begin, new_range.begin });
+                            ranges.push_back(new_range);
+                            ranges.push_back({ new_range.end, end });
+                        }
+
+                        return idx;
+                    }
+                };
+
+                using RefEntry = std::pair<Range , size_t>;
+                std::list<RefEntry> ref_vec_;
+            };
+
 
             /*
              * Internal method to perform the memory allocation for a graph
